@@ -1,10 +1,13 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # This software may be used and distributed in accordance with the terms of the Llama 3 Community License Agreement.
 
+import flash_attn
 import math
+import time
 from dataclasses import dataclass
+from flash_attn import flash_attn_qkvpacked_func, flash_attn_func,flash_attn_with_kvcache
 from typing import Optional, Tuple
-
+import sys
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
 import torch.nn.functional as F
@@ -149,6 +152,7 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
+        flashattention: bool = True
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -162,31 +166,87 @@ class Attention(nn.Module):
         self.cache_k = self.cache_k.to(xq)#保证数据类型和设备与xq一致
         self.cache_v = self.cache_v.to(xq)
 
-        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk#已经存过的kv,就不变了，因为前面的序列不受后面的序列影响
         self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
 
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
-
-        # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(
-            keys, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-        values = repeat_kv(
-            values, self.n_rep
-        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        values = values.transpose(
+        
+        ###     数据准备结束  
+        output = None
+        if(flashattention):
+            causal = (mask is not None)    
+            output = flash_attn_func(xq,keys,values,causal=causal)
+            # Q_BLOCK_SIZE = 1
+            # KV_BLOCK_SIZE = 1
+            # Q_LEN = xq.shape[2]
+            # K_LEN = keys.shape[2]
+            # Tr = Q_LEN // Q_BLOCK_SIZE
+            # Tc = K_LEN // KV_BLOCK_SIZE
+            # O = torch.zeros_like(xq).type_as(xq)
+            # l = torch.zeros(xq.shape[:-1])[..., None].type_as(xq)
+            # m = (torch.ones(xq.shape[:-1])[..., None] * float("-inf")).type_as(xq)
+            # Q_BLOCKS = torch.split(xq, Q_BLOCK_SIZE, dim=2)
+            # K_BLOCKS = torch.split(keys, KV_BLOCK_SIZE, dim=2)
+            # V_BLOCKS = torch.split(values, KV_BLOCK_SIZE, dim=2)
+            # O_BLOCKS = list(torch.split(O, Q_BLOCK_SIZE, dim=2))
+            # l_BLOCKS = list(torch.split(l, Q_BLOCK_SIZE, dim=2))
+            # m_BLOCKS = list(torch.split(m, Q_BLOCK_SIZE, dim=2))
+            # MASK_BLOCKS = None
+            # for i in range(0,Tr):
+            #     Qi = Q_BLOCKS[i]
+            #     Oi = O_BLOCKS[i]
+            #     li = l_BLOCKS[i]
+            #     mi = m_BLOCKS[i]
+            #     # S_i = torch.zeros(bsz, self.n_local_heads,Q_BLOCK_SIZE,K_LEN//KV_BLOCK_SIZE).type_as(xq)
+            #     for j in range(0,Tc):
+            #         Kj = K_BLOCKS[j]
+            #         Vj = V_BLOCKS[j]
+            #         S_ij = torch.matmul(Qi, Kj.transpose(2, 3)) / math.sqrt(self.head_dim)
+            #         if seqlen > 1:#即有mask,先按默认块的宽度是1写着，后面有需要再改
+            #             if(j-(start_pos)>i):
+            #                 S_ij += -1e-10
+            #         m_block_ij, _ = torch.max(S_ij, dim=-1, keepdims=True)
+            #         P_ij = torch.exp(S_ij - m_block_ij)
+            #         # if((i==0 and j == 1) or (i==0 and j==0)):
+            #         #      print("{},{}".format(i,j))
+            #         #      print(P_ij)
+            #         #      print(P_ij.shape)
+            #         #      print(P_ij.dtype)
+            #         #      print("------------------------")
+            #         #P_ij计算的都是当前块内的
+            #         l_block_ij = torch.sum(P_ij, dim=-1, keepdims=True)
+            #     #   P_ij_Vj = torch.einsum('... i j, ... j d -> ... i d', P_ij, Vj)        
+            #         mi_new = torch.maximum(m_block_ij, mi)
+            #         li_new = torch.exp(mi - mi_new) * li + torch.exp(m_block_ij - mi_new) * l_block_ij  
+            #         Oi = (li / li_new) * torch.exp(mi - mi_new) * Oi \
+            #             + (torch.exp(m_block_ij - mi_new) / li_new) * torch.matmul(P_ij, Vj) #结合下一个块的K,更新当前Q的O
+            #         mi = mi_new
+            #         li = li_new 
+            #     O_BLOCKS[i] = Oi
+            # #print(O_BLOCKS)
+            # # print("--------------666----------------")
+            # # sys.exit(0)
+            # output = torch.stack(O_BLOCKS)
+        else:
+            # repeat k/v heads if n_kv_heads < n_heads
+            keys = repeat_kv(
+                keys, self.n_rep
+            )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+            values = repeat_kv(
+                values, self.n_rep
+            )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+            xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+            keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+            values = values.transpose(
             1, 2
-        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
-        if mask is not None:
-            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
-        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
-        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
-        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)#contigous返回具有连续内存的张量
+            )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+            scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+            if mask is not None:
+                scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+            output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)#contigous返回具有连续内存的张量
         return self.wo(output)
 
 
@@ -254,7 +314,7 @@ class Transformer(nn.Module):
         self.params = params
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
-
+        
         self.tok_embeddings = VocabParallelEmbedding(
             params.vocab_size, params.dim, init_method=lambda x: x
         )
