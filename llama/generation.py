@@ -154,17 +154,19 @@ class Llama:
         max_prompt_len = max(len(t) for t in prompt_tokens)
         assert max_prompt_len <= params.max_seq_len
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)#提示加输出的最大长度
-
+        print(min_prompt_len)
+        print(total_len)
         pad_id = self.tokenizer.pad_id
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
         for k, t in enumerate(prompt_tokens):
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")#tokens[bsz,每句话长度]
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
-
+        start_time = time.time()
         prev_pos = 0
         eos_reached = torch.tensor([False] * bsz, device="cuda")
         input_text_mask = tokens != pad_id#不是pad_id为True
+        #print(total_len)
         if min_prompt_len == total_len:
             logits = self.model.forward(tokens, prev_pos)
             token_logprobs = -F.cross_entropy(
@@ -175,7 +177,6 @@ class Llama:
             )
 
         stop_tokens = torch.tensor(list(self.tokenizer.stop_tokens))
-
         for cur_pos in range(min_prompt_len, total_len):
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)#推理时先是只有prompt的输入，等模型有输出了，会将模型的输出作为输入继续forward
             if temperature > 0:
@@ -183,7 +184,6 @@ class Llama:
                 next_token = sample_top_p(probs, top_p)
             else:
                 next_token = torch.argmax(logits[:, -1], dim=-1)
-
             next_token = next_token.reshape(-1)
             # only replace token if prompt has already been generated
             next_token = torch.where(
@@ -203,7 +203,7 @@ class Llama:
             prev_pos = cur_pos
             if all(eos_reached):
                 break
-
+        print(time.time()-start_time)
         if logprobs:
             token_logprobs = token_logprobs.tolist()
         out_tokens, out_logprobs = [], []

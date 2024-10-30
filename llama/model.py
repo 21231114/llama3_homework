@@ -33,7 +33,7 @@ class ModelArgs:
     rope_theta: float = 500000
 
     max_batch_size: int = 32
-    max_seq_len: int = 2048
+    max_seq_len: int = 3000
 
 
 class RMSNorm(torch.nn.Module):
@@ -153,7 +153,7 @@ class Attention(nn.Module):
         start_pos: int,
         freqs_cis: torch.Tensor,
         mask: Optional[torch.Tensor],
-        flashattention: bool = True
+        flashattention: bool = False
     ):
         bsz, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
@@ -184,15 +184,18 @@ class Attention(nn.Module):
         output = None
         if(flashattention):
             causal = (mask is not None)   
-            sum = 0 
-            cumulative_q = torch.tensor([0]+[sum := sum + xq[i].shape[0] for i in  range(0,bsz)]).to(torch.int32)
-            sum = 0
-            cumulative_k = torch.tensor([0]+[sum := sum + keys[i].shape[0] for i in  range(0,bsz)]).to(torch.int32)
-            xq = xq.view(-1,self.n_local_heads,self.head_dim)
-            keys = keys.view(-1,self.n_local_heads,self.head_dim)
-            values = values.view(-1,self.n_local_heads,self.head_dim)
-            output = flash_attn_unpadded_func(xq,keys,values,cumulative_q,cumulative_k,cumulative_q[1],cumulative_k[1],0.0,causal=causal)
-            output = torch.stack(torch.chunk(output,seqlen)).view(bsz,seqlen,-1) 
+            # sum = 0 
+            # cumulative_q = torch.tensor([0]+[sum := sum + xq[i].shape[0] for i in  range(0,bsz)]).to(torch.int32)
+            # sum = 0
+            # cumulative_k = torch.tensor([0]+[sum := sum + keys[i].shape[0] for i in  range(0,bsz)]).to(torch.int32)
+            # xq = xq.view(-1,self.n_local_heads,self.head_dim)
+            # keys = keys.view(-1,self.n_local_heads,self.head_dim)
+            # values = values.view(-1,self.n_local_heads,self.head_dim)
+            # output = flash_attn_unpadded_func(xq,keys,values,cumulative_q,cumulative_k,cumulative_q[1],cumulative_k[1],0.0,causal=causal)
+            # output = torch.stack(torch.chunk(output,seqlen)).view(bsz,seqlen,-1) 
+           
+            output = flash_attn_unpadded_func(xq[0],keys[0],values[0],torch.tensor([0,xq[0].shape[0]]).to(torch.int32),torch.tensor([0,keys[0].shape[0]]).to(torch.int32),xq[0].shape[0],keys[0].shape[0],0.0,causal=causal)
+            return self.wo( output.view(bsz,seqlen,-1)) 
             # Q_BLOCK_SIZE = 1
             # KV_BLOCK_SIZE = 1
             # Q_LEN = xq.shape[2]
@@ -256,7 +259,7 @@ class Attention(nn.Module):
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
             output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
             output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)#contigous返回具有连续内存的张量
-        return self.wo(output)
+            return self.wo(output)
 
 
 class FeedForward(nn.Module):
