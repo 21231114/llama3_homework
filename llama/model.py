@@ -5,7 +5,8 @@ import flash_attn
 import math
 import time
 from dataclasses import dataclass
-from flash_attn import flash_attn_qkvpacked_func, flash_attn_func,flash_attn_with_kvcache
+from flash_attn.flash_attn_interface import flash_attn_unpadded_func
+from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_split_func
 from typing import Optional, Tuple
 import sys
 import fairscale.nn.model_parallel.initialize as fs_init
@@ -99,7 +100,7 @@ class Attention(nn.Module):
         self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.dim // args.n_heads
-
+        self.max_seq_len = args.max_seq_len
         self.wq = ColumnParallelLinear(
             args.dim,
             args.n_heads * self.head_dim,
@@ -172,11 +173,26 @@ class Attention(nn.Module):
         keys = self.cache_k[:bsz, : start_pos + seqlen]
         values = self.cache_v[:bsz, : start_pos + seqlen]
         
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(
+            keys, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(
+            values, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
         ###     数据准备结束  
         output = None
         if(flashattention):
-            causal = (mask is not None)    
-            output = flash_attn_func(xq,keys,values,causal=causal)
+            causal = (mask is not None)   
+            sum = 0 
+            cumulative_q = torch.tensor([0]+[sum := sum + xq[i].shape[0] for i in  range(0,bsz)]).to(torch.int32)
+            sum = 0
+            cumulative_k = torch.tensor([0]+[sum := sum + keys[i].shape[0] for i in  range(0,bsz)]).to(torch.int32)
+            xq = xq.view(-1,self.n_local_heads,self.head_dim)
+            keys = keys.view(-1,self.n_local_heads,self.head_dim)
+            values = values.view(-1,self.n_local_heads,self.head_dim)
+            output = flash_attn_unpadded_func(xq,keys,values,cumulative_q,cumulative_k,cumulative_q[1],cumulative_k[1],0.0,causal=causal)
+            output = torch.stack(torch.chunk(output,seqlen)).view(bsz,seqlen,-1) 
             # Q_BLOCK_SIZE = 1
             # KV_BLOCK_SIZE = 1
             # Q_LEN = xq.shape[2]
@@ -229,13 +245,6 @@ class Attention(nn.Module):
             # # sys.exit(0)
             # output = torch.stack(O_BLOCKS)
         else:
-            # repeat k/v heads if n_kv_heads < n_heads
-            keys = repeat_kv(
-                keys, self.n_rep
-            )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
-            values = repeat_kv(
-                values, self.n_rep
-            )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
             xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
             keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
             values = values.transpose(
